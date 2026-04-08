@@ -1,0 +1,372 @@
+version: "3.9"
+
+volumes:
+  pcap-data:
+  test-results:
+
+networks:
+  camotest:
+    driver: bridge
+
+services:
+  # ── HTTP echo backend (TCP tunnel target) ──────────────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command: ["python3", "/opt/tests/backend/server.py"]
+    networks:
+      - camotest
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  # ── UDP echo backend (UDP tunnel target) ───────────────────────
+  backend-udp:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command: ["udp_server"]
+    networks:
+      - camotest
+    expose:
+      - "18081/udp"
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  # ── CamoStream TCP Server ─────────────────────────────────────
+  camostream-server-tcp:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command:
+      - camostream
+      - -role=server
+      - -mode=tcp
+      - -listen=:39001
+      - -forward=backend:8080
+      - -bitrate-mbps=20
+      - -fps=60
+      - -decoy-rps=10
+      - -aes=0123456789abcdef0123456789abcdef
+      - -pcap=/data/pcap/tcp_server.pcap
+      - -pcap-max-mb=50
+      - -metrics=:9100
+      - -log=debug
+      - -showdrop
+    networks:
+      - camotest
+    expose:
+      - "39001"
+      - "9100"
+    volumes:
+      - pcap-data:/data/pcap
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9100/debug/vars"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ── CamoStream TCP Client ─────────────────────────────────────
+  camostream-client-tcp:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command:
+      - camostream
+      - -role=client
+      - -mode=tcp
+      - -listen=:37001
+      - -server=camostream-server-tcp:39001
+      - -bitrate-mbps=20
+      - -fps=60
+      - -decoy-rps=10
+      - -aes=0123456789abcdef0123456789abcdef
+      - -pcap=/data/pcap/tcp_client.pcap
+      - -pcap-max-mb=50
+      - -metrics=:9101
+      - -log=debug
+      - -showdrop
+    networks:
+      - camotest
+    expose:
+      - "37001"
+      - "9101"
+    ports:
+      - "37001:37001"
+    volumes:
+      - pcap-data:/data/pcap
+    depends_on:
+      camostream-server-tcp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9101/debug/vars"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ── CamoStream UDP Server ─────────────────────────────────────
+  camostream-server-udp:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command:
+      - camostream
+      - -role=server
+      - -mode=udp
+      - -wire=rtpish
+      - -listen=:39002
+      - -forward=backend-udp:18081
+      - -bitrate-mbps=20
+      - -fps=60
+      - -decoy-rps=10
+      - -rtcp-sr-rps=2
+      - -rtcp-rr-rps=3
+      - -rtpkeep-rps=4
+      - -stun-rps=1
+      - -aes=0123456789abcdef0123456789abcdef
+      - -pcap=/data/pcap/udp_server.pcap
+      - -pcap-max-mb=50
+      - -metrics=:9200
+      - -log=debug
+      - -showdrop
+    networks:
+      - camotest
+    expose:
+      - "39002/udp"
+      - "9200"
+    volumes:
+      - pcap-data:/data/pcap
+    depends_on:
+      backend-udp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9200/debug/vars"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ── CamoStream UDP Client ─────────────────────────────────────
+  camostream-client-udp:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command:
+      - camostream
+      - -role=client
+      - -mode=udp
+      - -wire=rtpish
+      - -listen=:37002
+      - -server=camostream-server-udp:39002
+      - -bitrate-mbps=20
+      - -fps=60
+      - -decoy-rps=10
+      - -rtcp-sr-rps=2
+      - -rtcp-rr-rps=3
+      - -rtpkeep-rps=4
+      - -stun-rps=1
+      - -aes=0123456789abcdef0123456789abcdef
+      - -pcap=/data/pcap/udp_client.pcap
+      - -pcap-max-mb=50
+      - -metrics=:9201
+      - -log=debug
+      - -showdrop
+    networks:
+      - camotest
+    expose:
+      - "37002/udp"
+      - "9201"
+    ports:
+      - "37002:37002/udp"
+    volumes:
+      - pcap-data:/data/pcap
+    depends_on:
+      camostream-server-udp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9201/debug/vars"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ── Network capture (sniff all traffic on camotest) ────────────
+  capture:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache tcpdump >/dev/null 2>&1
+        echo "[capture] starting tcpdump on all interfaces..."
+        tcpdump -i any -w /data/pcap/camotest_full.pcap -s 0 -U
+    networks:
+      - camotest
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - pcap-data:/data/pcap
+    restart: unless-stopped
+
+  # ── Test runner ────────────────────────────────────────────────
+  test-runner:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    command:
+      - bash
+      - -c
+      - |
+        echo "=== CamoStream Test Suite ==="
+        echo "Waiting for services to stabilize..."
+        sleep 3
+
+        PASS=0
+        FAIL=0
+        RESULTS=/data/results/report.txt
+        mkdir -p /data/results
+
+        echo "Test run started at $$(date -u)" | tee $$RESULTS
+
+        # ── Test 1: TCP tunnel end-to-end ──
+        echo -n "[TEST 1] TCP tunnel HTTP echo... " | tee -a $$RESULTS
+        RESP=$$(curl -sf --max-time 10 -X POST \
+          -H "Content-Type: text/plain" \
+          -d "hello-camostream-tcp" \
+          http://camostream-client-tcp:37001/test-tcp 2>&1)
+        if echo "$$RESP" | grep -q "hello-camostream-tcp"; then
+          echo "PASS" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL (response: $$RESP)" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 2: TCP tunnel multiple requests ──
+        echo -n "[TEST 2] TCP tunnel 10 sequential requests... " | tee -a $$RESULTS
+        TCP_OK=0
+        for i in $$(seq 1 10); do
+          R=$$(curl -sf --max-time 5 http://camostream-client-tcp:37001/seq-$$i 2>&1)
+          if echo "$$R" | grep -q "seq-$$i"; then
+            TCP_OK=$$((TCP_OK+1))
+          fi
+        done
+        if [ "$$TCP_OK" -eq 10 ]; then
+          echo "PASS ($$TCP_OK/10)" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL ($$TCP_OK/10)" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 3: TCP metrics endpoint ──
+        echo -n "[TEST 3] TCP server metrics available... " | tee -a $$RESULTS
+        METRICS=$$(curl -sf --max-time 5 http://camostream-server-tcp:9100/debug/vars 2>&1)
+        if echo "$$METRICS" | grep -q "bytes_up"; then
+          echo "PASS" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 4: TCP client metrics endpoint ──
+        echo -n "[TEST 4] TCP client metrics available... " | tee -a $$RESULTS
+        METRICS=$$(curl -sf --max-time 5 http://camostream-client-tcp:9101/debug/vars 2>&1)
+        if echo "$$METRICS" | grep -q "bytes_up"; then
+          echo "PASS" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 5: UDP server metrics endpoint ──
+        echo -n "[TEST 5] UDP server metrics available... " | tee -a $$RESULTS
+        METRICS=$$(curl -sf --max-time 5 http://camostream-server-udp:9200/debug/vars 2>&1)
+        if echo "$$METRICS" | grep -q "bytes_up"; then
+          echo "PASS" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 6: UDP client metrics endpoint ──
+        echo -n "[TEST 6] UDP client metrics available... " | tee -a $$RESULTS
+        METRICS=$$(curl -sf --max-time 5 http://camostream-client-udp:9201/debug/vars 2>&1)
+        if echo "$$METRICS" | grep -q "bytes_up"; then
+          echo "PASS" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 7: Decoy metrics are non-zero (TCP server) ──
+        echo -n "[TEST 7] Decoy injection active (TCP server)... " | tee -a $$RESULTS
+        sleep 5
+        METRICS=$$(curl -sf --max-time 5 http://camostream-server-tcp:9100/debug/vars 2>&1)
+        DECOY=$$(echo "$$METRICS" | grep -o '"shim_decoy_sent": [0-9]*' | grep -o '[0-9]*')
+        if [ -n "$$DECOY" ] && [ "$$DECOY" -gt 0 ]; then
+          echo "PASS (decoys sent: $$DECOY)" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL (decoy count: $$DECOY)" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Test 8: PCAP files created ──
+        echo -n "[TEST 8] PCAP files generated... " | tee -a $$RESULTS
+        PCAP_COUNT=$$(ls /data/pcap/*.pcap 2>/dev/null | wc -l)
+        if [ "$$PCAP_COUNT" -ge 4 ]; then
+          echo "PASS ($$PCAP_COUNT pcap files)" | tee -a $$RESULTS
+          PASS=$$((PASS+1))
+        else
+          echo "FAIL (only $$PCAP_COUNT pcap files)" | tee -a $$RESULTS
+          FAIL=$$((FAIL+1))
+        fi
+
+        # ── Summary ──
+        echo "" | tee -a $$RESULTS
+        echo "=== Results: $$PASS passed, $$FAIL failed ===" | tee -a $$RESULTS
+        echo "Test run finished at $$(date -u)" | tee -a $$RESULTS
+
+        # Copy pcap listing to results
+        ls -lh /data/pcap/*.pcap >> $$RESULTS 2>/dev/null
+
+        if [ "$$FAIL" -gt 0 ]; then
+          exit 1
+        fi
+        exit 0
+    networks:
+      - camotest
+    volumes:
+      - pcap-data:/data/pcap
+      - test-results:/data/results
+    depends_on:
+      camostream-client-tcp:
+        condition: service_healthy
+      camostream-client-udp:
+        condition: service_healthy
+      camostream-server-tcp:
+        condition: service_healthy
+      camostream-server-udp:
+        condition: service_healthy
+      capture:
+        condition: service_started
