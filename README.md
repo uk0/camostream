@@ -1,98 +1,209 @@
-### CamoStreamPro
+# CamoStream
 
->我也不知道有什么用
+Network traffic obfuscation tool that disguises real UDP/TCP traffic as legitimate video streaming protocols. Supports multiple wire formats for different camouflage scenarios.
 
-#### build
+> For authorized internal security testing only.
 
-```bash
-go build -o camostream main.go
+## Wire Modes
+
+| Mode | Disguise As | Protocol Stack |
+|------|-------------|----------------|
+| `rtpish` | Generic RTP video | RTP(12B) + Shim + Payload |
+| `webrtc` | WebRTC video call | SRTP(24B) + Extensions + Auth Tag + Opus Audio + Compound RTCP + STUN |
+| `ipcam` | Surveillance camera | H.264 FU-A over RTP + SPS/PPS + GOP I/P frames |
+| `shim` | Raw tunnel (no disguise) | ShimHeader + Payload |
+
+## Architecture
+
+```
+[App] --UDP--> [CamoStream Client :37001]
+                    |
+                    | encrypted + disguised tunnel
+                    v
+               [CamoStream Server :39001] --UDP--> [Real Backend :18081]
 ```
 
-#### tcp 
+## Build
 
 ```bash
+go build -o camostream .
+```
 
-./camostream -role=client -mode=tcp -listen=:37001 -server=127.0.0.1:39001 \
-  -bitrate-mbps=20 -decoy-rps=10 \
-  -pcap=tcp_client.pcap -pcap-max-mb=50 -metrics=:9101 -log=info
-  
-  
+Requires Go 1.24+, zero external dependencies (stdlib only).
+
+## Quick Start
+
+### WebRTC Mode (Recommended)
+
+```bash
+# Server side
+./camostream -role=server -mode=udp -wire=webrtc \
+  -listen=:39001 -forward=127.0.0.1:18081 \
+  -bitrate-mbps=20 -fps=30 \
+  -aes=0123456789abcdef0123456789abcdef \
+  -decoy-rps=5 -rtcp-sr-rps=1 -stun-rps=0.2 \
+  -metrics=:9100 -log=info
+
+# Client side
+./camostream -role=client -mode=udp -wire=webrtc \
+  -listen=:37001 -server=<server-ip>:39001 \
+  -bitrate-mbps=20 -fps=30 \
+  -aes=0123456789abcdef0123456789abcdef \
+  -decoy-rps=5 -rtcp-sr-rps=1 -stun-rps=0.2 \
+  -metrics=:9101 -log=info
+```
+
+### IPCAM Mode (Surveillance Camera)
+
+```bash
+# Server
+./camostream -role=server -mode=udp -wire=ipcam \
+  -listen=:39001 -forward=127.0.0.1:18081 \
+  -ipcam-fps=25 -ipcam-gop=50 -bitrate-mbps=4 \
+  -aes=0123456789abcdef0123456789abcdef \
+  -metrics=:9100
+
+# Client
+./camostream -role=client -mode=udp -wire=ipcam \
+  -listen=:37001 -server=<server-ip>:39001 \
+  -ipcam-fps=25 -ipcam-gop=50 -bitrate-mbps=4 \
+  -aes=0123456789abcdef0123456789abcdef \
+  -metrics=:9101
+```
+
+### TCP Mode
+
+```bash
+# Server
 ./camostream -role=server -mode=tcp -listen=:39001 -forward=127.0.0.1:4141 \
-  -bitrate-mbps=20 -decoy-rps=10 \
-  -pcap=tcp_server.pcap -pcap-max-mb=50 -metrics=:9100 -log=info
+  -bitrate-mbps=20 -decoy-rps=10 -aes=0123456789abcdef0123456789abcdef
 
+# Client
+./camostream -role=client -mode=tcp -listen=:37001 -server=127.0.0.1:39001 \
+  -bitrate-mbps=20 -decoy-rps=10 -aes=0123456789abcdef0123456789abcdef
 ```
 
+## SpeedTest Demo
 
-
-
-
-
-
-
-#### udp
+Built-in CRC32 integrity verification and throughput measurement:
 
 ```bash
-./camostream -role=server -mode=udp -listen=:39001 -forward=127.0.0.1:18081 \
-  -wire=rtpish -fps=60 -bitrate-mbps=20 \
-  -decoy-rps=12 \
-  -rtcp-sr-rps=2 -rtcp-rr-rps=3 -rtpkeep-rps=4 -stun-rps=1 \
-  -pcap=udp_server.pcap -pcap-max-mb=100 -metrics=:9100 -log=info
-  
-  
-./camostream -role=client -mode=udp -listen=:37001 -server=127.0.0.1:39001 \
-  -wire=rtpish -fps=60 -bitrate-mbps=20 \
-  -decoy-rps=12 \
-  -rtcp-sr-rps=2 -rtcp-rr-rps=3 -rtpkeep-rps=4 -stun-rps=1 \
-  -pcap=udp_client.pcap -pcap-max-mb=100 -metrics=:9101 -log=info
-  
+# Start tunnel (webrtc mode)
+./camostream -role=server -mode=udp -wire=webrtc -listen=:39001 -forward=127.0.0.1:18081 \
+  -bitrate-mbps=50 -aes=0123456789abcdef0123456789abcdef -dtls=false -log=warn &
+./camostream -role=client -mode=udp -wire=webrtc -listen=:37001 -server=127.0.0.1:39001 \
+  -bitrate-mbps=50 -aes=0123456789abcdef0123456789abcdef -dtls=false -log=warn &
+
+# Start receiver
+go run demo/speedtest.go -mode=server -recv=:18081 &
+
+# Run speedtest (200 pps, 1000 byte packets, 10 seconds)
+go run demo/speedtest.go -mode=client -send=127.0.0.1:37001 -size=1000 -pps=200 -duration=10
 ```
 
+Or run all wire modes:
 
+```bash
+bash demo/run_speedtest.sh
+```
 
+### SpeedTest Results (Local, WebRTC Mode)
 
-#### feat
+```
+Sent:      1997 packets, 1.60 Mbps
+Received:  818 packets through tunnel
+CRC32 OK:  818   FAIL: 0   (100% integrity)
+OOO: 0  DUP: 0
+```
 
-*	✅ UDP/TCP 双协议、Client/Server 双角色
-*	✅ UDP：RTP-ish（12B RTP 头）+ shim 载荷、60/120fps、GOP 峰谷、抖动
-*	✅ 码率整形（令牌桶）
-*	✅ 诱饵插播（shim‑decoy）+ AES‑GCM 可选
-*	✅ 额外伪报文（UDP 无 shim）：RTCP SR、RTCP RR、纯 RTP keepalive、STUN Binding
-*	✅ 自测模式（UDP Echo + Client/Server + 负载）
-*	✅ PCAP（UDP RAW）与指标（/debug/vars）
+## Security Features
 
+### Encryption
+- **AES-GCM** encrypts the entire shim header + payload together
+- Magic bytes (`0x5C10ADED`) never appear on the wire when encryption is enabled
+- Without AES: magic is XOR-masked with session-derived key to prevent static fingerprinting
 
-#### 增强
+### WebRTC Camouflage
+- 24-byte SRTP headers with `0xBEDE` extensions (abs-send-time, transport-cc)
+- 10-byte SRTP authentication tag on every packet
+- Opus audio stream at 50 pps (PT=111) with separate SSRC
+- Compound RTCP (SR + SDES with CNAME) per RFC 3550
+- STUN Binding Request/Response with FINGERPRINT attribute
+- STUN consent freshness every 5 seconds
+- DTLS 1.2 handshake simulation at session start (optional)
 
-*	UDP 方向新增无 shim 的额外伪报文（中间盒可见，但业务端不感知）：
-*	RTCP SR（PT=200）：包含 sender SSRC、NTP 时间戳、RTP 时间戳、包/字节计数。
-*	RTCP RR（PT=201）：简单接收者报告，无 report block。
-*	纯 RTP keepalive：PT=13（CN 习惯），小 payload/可零 payload。
-*	STUN Binding Request：标准 20B 报文，含 Magic Cookie 和 Transaction ID。
-这些报文不带 shim，因此服务端在解析 RTP-ish+shim 失败时直接 continue 丢弃；同样客户端也会丢弃，从而只起到“流量伪装/背景噪声”作用。
-*	仍保持诱饵为“插播”（不替代真实帧）：
-*	TCP：真实帧 → （可选）插播 shim‑decoy。
-*	UDP：真实帧（RTP-ish+shim 或 shim）→ （可选）插播 shim‑decoy → （可选）插播 RTCP/RTP/STUN 等额外无壳伪报文。
-*	新增 CLI 控制这类伪报文注入概率（UDP only）：
-*	-rtcp-sr-pct：插播 RTCP SR 的概率（默认 4）
-*	-rtcp-rr-pct：插播 RTCP RR 的概率（默认 6）
-*	-rtpkeep-pct：插播纯 RTP keepalive 的概率（默认 5）
-*	-stun-pct：插播 STUN Binding 的概率（默认 3）
+### Decoy System
+- **Shim decoys**: encrypted fake frames injected at configurable RPS
+- **RTCP SR/RR**: realistic sender/receiver reports
+- **RTP keepalive**: comfort noise (PT=13) packets
+- **STUN Binding**: ICE connectivity checks with proper responses
+- Decoys sent with 2-8ms random delay to avoid burst timing fingerprint
 
+## DPI Resistance
 
->备注：-wire=rtpish 仅对 UDP 生效；TCP 会打印一个 WARN 并忽略
+Tested with automated 7-dimension analysis:
 
+| Dimension | Score | Description |
+|-----------|-------|-------------|
+| Protocol Conformance | 100/100 | All packets classify as RTP/RTCP/STUN |
+| Packet Size Distribution | 69/100 | Bimodal (audio small + video large) |
+| Timing Analysis | 69/100 | Consistent with video call FPS |
+| Entropy | 53/100 | High entropy from AES-GCM |
+| RTP Consistency | 100/100 | Perfect sequence/timestamp progression |
+| Decoy Coverage | 40/100 | Multiple decoy types present |
+| **Overall** | **73.8/100** | **Grade C - Passes basic DPI** |
 
+## CLI Reference
 
+```
+-wire       shim|rtpish|webrtc|ipcam    Wire format (UDP only)
+-role       server|client|selftest      Role
+-mode       udp|tcp                     Transport mode
+-listen     :port                       Listen address
+-server     host:port                   Server address (client mode)
+-forward    host:port                   Forward target (server mode)
+-aes        hex-key                     AES-GCM 128/192/256 bit key
+-bitrate-mbps  N                        Bitrate cap in Mbps
+-fps        N                           Frames per second
+-decoy-rps  N                           Shim decoy frames per second
+-rtcp-sr-rps N                          RTCP SR decoys per second
+-rtcp-rr-rps N                          RTCP RR decoys per second
+-stun-rps   N                           STUN decoys per second
+-dtls       bool                        DTLS handshake (webrtc, default true)
+-audio-rps  N                           Audio packets/sec (webrtc, default 50)
+-ipcam-fps  N                           Camera FPS (ipcam, default 25)
+-ipcam-gop  N                           GOP size (ipcam, default 50)
+-pcap       path                        PCAP output file
+-pcap-max-mb N                          Max PCAP size in MB
+-metrics    :port                       Metrics HTTP endpoint
+-log        debug|info|warn|error       Log level
+```
 
-#### 指标
+## Metrics
 
-*	http://127.0.0.1:9100/debug/vars（server）
-*	http://127.0.0.1:9101/debug/vars（client）
-*	关注：bytes_*、frames_*、decoy_dropped、shim_decoy_sent、rtcp_sr_sent、rtcp_rr_sent、rtp_keepalive_sent、stun_sent
+Available at `http://host:port/debug/vars`:
 
+```
+bytes_up, bytes_down, frames_up, frames_down,
+decoy_dropped, sessions_active, shim_decoy_sent,
+rtcp_sr_sent, rtcp_rr_sent, rtp_keepalive_sent,
+stun_sent, dtls_handshake_sent, audio_packets_sent
+```
 
-#### Warn
+## Project Structure
 
-仅用于授权的内部安全测试。涉及伪装/混淆的功能，请严格遵循公司及法律合规要求。
-TCP 的 PCAP 是伪造的网络层帧，用于 debug 观察我们应用层写入/读到的 shim 帧，不代表内核真实的 TCP 会话（没有三次握手、窗口/ACK 真实演进），但校验和正确，可在 Wireshark 中查看和过滤。
+```
+├── main.go           Core framework, UDP/TCP client/server, CLI
+├── crypto.go         sealFrame/openFrame (full shim+payload encryption)
+├── dtls.go           DTLS 1.2 handshake simulation
+├── wire.go           Unified encode/decode path for all wire formats
+├── wire_webrtc.go    WebRTC: SRTP, audio ticker, compound RTCP, STUN
+├── wire_ipcam.go     IPCAM: H.264 FU-A, GOP state, SPS/PPS
+├── demo/             SpeedTest demo with CRC32 verification
+├── sim/              UDP echo server for testing
+└── tests/            E2E tests, PCAP analysis, Docker environment
+```
+
+## Disclaimer
+
+This tool is designed for authorized internal security testing only. Traffic obfuscation capabilities must be used in compliance with applicable laws and organizational policies.
