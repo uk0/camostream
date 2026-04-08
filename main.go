@@ -46,6 +46,8 @@ var (
 	metricRTPkeepSent  = expvar.NewInt("rtp_keepalive_sent")
 	metricSTUNSent     = expvar.NewInt("stun_sent")
 	metricShimDecoySent = expvar.NewInt("shim_decoy_sent")
+	metricDTLSSent      = expvar.NewInt("dtls_handshake_sent")
+	metricAudioSent     = expvar.NewInt("audio_packets_sent")
 )
 
 /* ============ CLI / Config ============ */
@@ -64,6 +66,8 @@ const (
 
 	WireShim   Wire = "shim"   // ShimHeader + Payload
 	WireRTPish Wire = "rtpish" // RTP(12) + Shim + Payload (UDP only)
+	WireWebRTC Wire = "webrtc" // DTLS+SRTP(24)+Shim+Payload+AuthTag (UDP only)
+	WireIPCam  Wire = "ipcam"  // H.264/RTP surveillance camera (UDP only)
 )
 
 type Config struct {
@@ -106,6 +110,15 @@ type Config struct {
 	SelfDur     time.Duration
 	LogLevel    string
 	LogDrop     bool
+
+	// WebRTC mode options
+	EnableDTLS  bool // simulate DTLS handshake at session start
+	AudioRps    int  // audio packets per second (default 50 for Opus 20ms)
+	STUNInterval int // STUN consent freshness interval in seconds (default 5)
+
+	// IPCAM mode options
+	IPCAMFPS    int // surveillance camera FPS (default 25)
+	IPCAMGop    int // GOP size in frames (default 50 = 2 seconds)
 }
 
 func defaultConfig() *Config {
@@ -149,6 +162,12 @@ func defaultConfig() *Config {
 		SelfDur:     15 * time.Second,
 		LogLevel:    "info",
 		LogDrop:     false,
+
+		EnableDTLS:   true,
+		AudioRps:     50,
+		STUNInterval: 5,
+		IPCAMFPS:     25,
+		IPCAMGop:     50,
 	}
 }
 
@@ -159,7 +178,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.Listen, "listen", cfg.Listen, "listen addr")
 	flag.StringVar(&cfg.ServerAddr, "server", cfg.ServerAddr, "server addr (client)")
 	flag.StringVar(&cfg.ForwardAddr, "forward", cfg.ForwardAddr, "forward addr (server)")
-	flag.StringVar((*string)(&cfg.Wire), "wire", string(cfg.Wire), "shim|rtpish (udp)")
+	flag.StringVar((*string)(&cfg.Wire), "wire", string(cfg.Wire), "shim|rtpish|webrtc|ipcam (udp)")
 	flag.IntVar(&cfg.FPS, "fps", cfg.FPS, "60|120")
 	flag.IntVar(&cfg.GOPMs, "gop", cfg.GOPMs, "keyframe interval ms")
 	flag.IntVar(&cfg.BitrateMbps, "bitrate-mbps", cfg.BitrateMbps, "20|40 etc.")
@@ -198,12 +217,21 @@ func parseFlags() *Config {
 	flag.DurationVar(&cfg.SelfDur, "duration", cfg.SelfDur, "selftest duration")
 	flag.StringVar(&cfg.LogLevel, "log", cfg.LogLevel, "debug|info|warn|error")
 	flag.BoolVar(&cfg.LogDrop, "showdrop", cfg.LogDrop, "log when dropping decoy")
+
+	// WebRTC mode options
+	flag.BoolVar(&cfg.EnableDTLS, "dtls", cfg.EnableDTLS, "simulate DTLS handshake (webrtc mode)")
+	flag.IntVar(&cfg.AudioRps, "audio-rps", cfg.AudioRps, "audio packets per second (webrtc mode, default 50)")
+	flag.IntVar(&cfg.STUNInterval, "stun-interval", cfg.STUNInterval, "STUN consent interval seconds (webrtc mode)")
+
+	// IPCAM mode options
+	flag.IntVar(&cfg.IPCAMFPS, "ipcam-fps", cfg.IPCAMFPS, "surveillance camera FPS (ipcam mode, default 25)")
+	flag.IntVar(&cfg.IPCAMGop, "ipcam-gop", cfg.IPCAMGop, "GOP size in frames (ipcam mode, default 50)")
+
 	flag.Parse()
 
 	cfg.SessID = uint32(sessFlag)
-	if cfg.Mode == ModeTCP && cfg.Wire == WireRTPish {
-		// 仅提示：RTP-ish 只在 UDP 生效
-		fmt.Println("[WARN] wire=rtpish is ignored in TCP mode.")
+	if cfg.Mode == ModeTCP && cfg.Wire != WireShim {
+		fmt.Printf("[WARN] wire=%s is only effective in UDP mode, falling back to shim for TCP.\n", cfg.Wire)
 	}
 	return cfg
 }
@@ -980,26 +1008,15 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 				dst := ip4OrLoopback(uc.LocalAddr().(*net.UDPAddr).IP)
 				rt.pc.WriteUDP(src, from.Port, dst, uc.LocalAddr().(*net.UDPAddr).Port, raw)
 
-				var payload []byte
-				if rt.cfg.Wire == WireRTPish {
-					_, _, rest, e := stripRTP(raw); if e != nil { continue }
-					h, p, e2 := parseShimFull(rest); if e2 != nil { continue }
-					if (h.Flags & flagDecoy) != 0 { metricDecoyDropped.Add(1); if rt.dropLog { logf(LDebug, "[client] drop decoy %dB", len(p)) }; continue }
-					payload = p
-					if (h.Flags & flagEnc) != 0 && rt.ae != nil {
-						ns := rt.ae.aead.NonceSize(); if len(payload) >= ns {
-							if plain, e := rt.ae.open(payload[:ns], payload[ns:]); e == nil { payload = plain }
-						}
-					}
-				} else {
-					h, p, e2 := parseShimFull(raw); if e2 != nil { continue }
-					if (h.Flags & flagDecoy) != 0 { metricDecoyDropped.Add(1); if rt.dropLog { logf(LDebug, "[client] drop decoy %dB", len(p)) }; continue }
-					payload = p
-					if (h.Flags & flagEnc) != 0 && rt.ae != nil {
-						ns := rt.ae.aead.NonceSize(); if len(payload) >= ns {
-							if plain, e := rt.ae.open(payload[:ns], payload[ns:]); e == nil { payload = plain }
-						}
-					}
+				// Skip DTLS/STUN control packets (not data)
+				if isDTLSRange(raw[0]) || isSTUNPacket(raw) { continue }
+
+				h, payload, e2 := decodeUDPFrame(rt.cfg, rt.ae, raw, sess)
+				if e2 != nil { continue }
+				if (h.Flags & flagDecoy) != 0 {
+					metricDecoyDropped.Add(1)
+					if rt.dropLog { logf(LDebug, "[client] drop decoy %dB", len(payload)) }
+					continue
 				}
 				appPeerMu.RLock(); dstPeer := appPeer; appPeerMu.RUnlock()
 				if dstPeer != nil {
@@ -1013,21 +1030,9 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 			appPeerMu.Lock(); appPeer = from; appPeerMu.Unlock()
 			p := append([]byte(nil), buf[:n]...)
 
-			// a) 真实帧（带 shim）
-			flags := uint8(0)
-			pp := p
-			if rt.ae != nil {
-				if c, nonce, e := rt.ae.seal(p); e == nil { pp = append(nonce, c...); flags |= flagEnc }
-			}
-			h := shimHeader{Magic: magicConst, Version: version, Mode: modeUDP, Flags: flags,
-				SessionID: sess, TsMs: uint32(time.Now().UnixMilli()), Len: uint32(len(pp))}
-			frame := append(h.Marshal(), pp...)
-			if rt.cfg.Wire == WireRTPish {
-				rtpTs += uint32(step)
-				rtpHdr := buildRTPHeader(rtp.seq, rtpTs, 96, false, rtp.ssrc)
-				rtp.seq++
-				frame = append(rtpHdr, frame...)
-			}
+			// a) 真实帧
+			var twccSeq uint32
+			frame := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, sess, p, false, &twccSeq)
 			rt.tb.wait(len(frame) + 28)
 			_, _ = uc.WriteToUDP(frame, saddr)
 			metricFramesUp.Add(1); metricBytesUp.Add(int64(n))
@@ -1035,30 +1040,14 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 			dstIP := ip4OrLoopback(saddr.IP)
 			rt.pc.WriteUDP(srcIP, uc.LocalAddr().(*net.UDPAddr).Port, dstIP, saddr.Port, frame)
 
-			// b) shim 诱饵（带 shim，RPS 优先，否则按百分比）
+			// b) shim 诱饵
 			sendDecoy := false
 			if rt.shimUpRL != nil && rt.shimUpRL.takeMax(1) > 0 { sendDecoy = true
 			} else if rt.cfg.DecoyRps <= 0 && grnd.Intn(100) < rt.cfg.DecoyPct { sendDecoy = true }
 			if sendDecoy {
 				djunk := make([]byte, len(p))
 				_, _ = cryptoRand.Read(djunk)
-				decFlags := uint8(flagDecoy)
-				decPayload := djunk
-				if rt.ae != nil {
-					if c, nonce, e := rt.ae.seal(decPayload); e == nil {
-						decPayload = append(nonce, c...)
-						decFlags |= flagEnc
-					}
-				}
-				hd := shimHeader{Magic: magicConst, Version: version, Mode: modeUDP, Flags: decFlags,
-					SessionID: sess, TsMs: uint32(time.Now().UnixMilli()), Len: uint32(len(decPayload))}
-				df := append(hd.Marshal(), decPayload...)
-				if rt.cfg.Wire == WireRTPish {
-					rtpTs += uint32(step)
-					rtpHdr := buildRTPHeader(rtp.seq, rtpTs, 96, false, rtp.ssrc)
-					rtp.seq++
-					df = append(rtpHdr, df...)
-				}
+				df := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, sess, djunk, true, &twccSeq)
 				rt.tb.wait(len(df) + 28)
 				_, _ = uc.WriteToUDP(df, saddr)
 				metricFramesUp.Add(1); metricShimDecoySent.Add(1)
@@ -1131,30 +1120,17 @@ func runUDPServer(ctx context.Context, rt *runtimeCtx) error {
 		dst := ip4OrLoopback(ln.LocalAddr().(*net.UDPAddr).IP)
 		rt.pc.WriteUDP(src, caddr.Port, dst, ln.LocalAddr().(*net.UDPAddr).Port, raw)
 
-		// 剥线（RTP+Shim 或 Shim）
-		var h shimHeader
-		var p []byte
-		if rt.cfg.Wire == WireRTPish {
-			_, _, rest, e := stripRTP(raw); if e != nil { continue }
-			hh, pp, e2 := parseShimFull(rest); if e2 != nil { continue }
-			h, p = hh, pp
-		} else {
-			hh, pp, e2 := parseShimFull(raw); if e2 != nil { continue }
-			h, p = hh, pp
-		}
+		// Skip DTLS/STUN control packets
+		if len(raw) > 0 && (isDTLSRange(raw[0]) || isSTUNPacket(raw)) { continue }
+
+		h, p, e2 := decodeUDPFrame(rt.cfg, rt.ae, raw, 0)
+		if e2 != nil { continue }
 		k := key{ip: caddr.IP.String(), port: caddr.Port, sess: h.SessionID}
 
-		// 丢诱饵 & 解密
 		if (h.Flags & flagDecoy) != 0 {
 			metricDecoyDropped.Add(1)
 			if rt.dropLog { logf(LDebug, "[server] drop shim-decoy %dB", len(p)) }
 			continue
-		}
-		if (h.Flags & flagEnc) != 0 && rt.ae != nil {
-			ns := rt.ae.aead.NonceSize()
-			if len(p) >= ns {
-				if plain, e := rt.ae.open(p[:ns], p[ns:]); e == nil { p = plain }
-			}
 		}
 
 		mu.Lock()
@@ -1178,24 +1154,9 @@ func runUDPServer(ctx context.Context, rt *runtimeCtx) error {
 					if e2 != nil { return }
 					pp := append([]byte(nil), b[:n2]...)
 
-					// a) 真实帧（带 shim）
-					flags := uint8(0)
-					payload := pp
-					if rt.ae != nil {
-						if c, nonce, e := rt.ae.seal(payload); e == nil {
-							payload = append(nonce, c...)
-							flags |= flagEnc
-						}
-					}
-					h := shimHeader{Magic: magicConst, Version: version, Mode: modeUDP, Flags: flags,
-						SessionID: k.sess, TsMs: uint32(time.Now().UnixMilli()), Len: uint32(len(payload))}
-					pkt := append(h.Marshal(), payload...)
-					if rt.cfg.Wire == WireRTPish {
-						rtpTs += uint32(step)
-						rtpHdr := buildRTPHeader(rtp.seq, rtpTs, 96, false, rtp.ssrc)
-						rtp.seq++
-						pkt = append(rtpHdr, pkt...)
-					}
+					// a) 真实帧
+					var twccSeq uint32
+					pkt := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, k.sess, pp, false, &twccSeq)
 					rt.tb.wait(len(pkt) + 28)
 					_, _ = ln.WriteToUDP(pkt, s.client)
 					metricFramesDown.Add(1); metricBytesDown.Add(int64(n2))
@@ -1203,30 +1164,14 @@ func runUDPServer(ctx context.Context, rt *runtimeCtx) error {
 					dst2 := ip4OrLoopback(s.client.IP)
 					rt.pc.WriteUDP(src2, ln.LocalAddr().(*net.UDPAddr).Port, dst2, s.client.Port, pkt)
 
-					// b) shim 诱饵（RPS 优先，否则百分比）
+					// b) shim 诱饵
 					sendDecoy := false
 					if rt.shimDownRL != nil && rt.shimDownRL.takeMax(1) > 0 { sendDecoy = true
 					} else if rt.cfg.DecoyRps <= 0 && grnd.Intn(100) < rt.cfg.DecoyPct { sendDecoy = true }
 					if sendDecoy {
 						djunk := make([]byte, len(pp))
 						_, _ = cryptoRand.Read(djunk)
-						decFlags := uint8(flagDecoy)
-						decPayload := djunk
-						if rt.ae != nil {
-							if c, nonce, e := rt.ae.seal(decPayload); e == nil {
-								decPayload = append(nonce, c...)
-								decFlags |= flagEnc
-							}
-						}
-						hd := shimHeader{Magic: magicConst, Version: version, Mode: modeUDP, Flags: decFlags,
-							SessionID: k.sess, TsMs: uint32(time.Now().UnixMilli()), Len: uint32(len(decPayload))}
-						df := append(hd.Marshal(), decPayload...)
-						if rt.cfg.Wire == WireRTPish {
-							rtpTs += uint32(step)
-							rtpHdr := buildRTPHeader(rtp.seq, rtpTs, 96, false, rtp.ssrc)
-							rtp.seq++
-							df = append(rtpHdr, df...)
-						}
+						df := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, k.sess, djunk, true, &twccSeq)
 						rt.tb.wait(len(df) + 28)
 						_, _ = ln.WriteToUDP(df, s.client)
 						metricFramesDown.Add(1); metricShimDecoySent.Add(1)
