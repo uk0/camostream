@@ -147,3 +147,13 @@ func isSTUNPacket(data []byte) bool {
 	cookie := binary.BigEndian.Uint32(data[4:8])
 	return cookie == 0x2112A442
 }
+
+// isSTUNRequest checks if a STUN packet is a Binding Request (type 0x0001).
+func isSTUNRequest(data []byte) bool {
+	if len(data) < 20 {
+		return false
+	}
+	msgType := binary.BigEndian.Uint16(data[0:2])
+	cookie := binary.BigEndian.Uint32(data[4:8])
+	return cookie == 0x2112A442 && msgType == 0x0001
+}

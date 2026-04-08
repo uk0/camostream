@@ -793,6 +793,12 @@ type runtimeCtx struct {
 	// Shim decoy RPS
 	shimUpRL   *rateLimiter
 	shimDownRL *rateLimiter
+
+	// WebRTC shared state
+	twccSeq  uint32 // shared transport-cc counter (atomic)
+
+	// IPCAM shared state
+	gop      *gopState
 }
 
 func runMetrics(addr string) {
@@ -987,13 +993,35 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 	logf(LInfo, "[client][udp] %s -> server %s (sess=%d, wire=%s, %dfps, %dMbps)",
 		rt.cfg.Listen, rt.cfg.ServerAddr, sess, rt.cfg.Wire, rt.cfg.FPS, rt.cfg.BitrateMbps)
 
+	// WebRTC: simulate DTLS handshake before media
+	if rt.cfg.Wire == WireWebRTC && rt.cfg.EnableDTLS {
+		logf(LInfo, "[client] performing DTLS handshake with server...")
+		if err := performDTLSHandshake(uc, saddr, false, rt.pc); err != nil {
+			logf(LWarn, "[client] DTLS handshake failed: %v (continuing)", err)
+		} else {
+			metricDTLSSent.Add(1)
+			logf(LInfo, "[client] DTLS handshake complete")
+		}
+	}
+
 	var appPeerMu sync.RWMutex
 	var appPeer *net.UDPAddr
 
-	// RTP 累加
 	var rtp = rtpState{seq: uint16(grnd.Uint32()), ssrc: grnd.Uint32()}
 	var rtpTs uint32
 	step := 90000 / max(1, rt.cfg.FPS)
+
+	// WebRTC: launch audio ticker and STUN consent freshness
+	if rt.cfg.Wire == WireWebRTC {
+		audio := &audioState{
+			seq:     uint16(grnd.Uint32()),
+			ts:      0,
+			ssrc:    grnd.Uint32(), // different SSRC for audio
+			twccSeq: &rt.twccSeq,
+		}
+		go runAudioTicker(ctx, uc, saddr, audio, rt.tb, rt.pc)
+		go runSTUNConsent(ctx, uc, saddr, rt.pc)
+	}
 
 	go func() {
 		buf := make([]byte, 64<<10)
@@ -1001,15 +1029,22 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 			n, from, err := uc.ReadFromUDP(buf)
 			if err != nil { return }
 
-			// 来自 server：解壳 -> 发给应用
 			if from.IP.Equal(saddr.IP) && from.Port == saddr.Port {
 				raw := append([]byte(nil), buf[:n]...)
 				src := ip4OrLoopback(from.IP)
 				dst := ip4OrLoopback(uc.LocalAddr().(*net.UDPAddr).IP)
 				rt.pc.WriteUDP(src, from.Port, dst, uc.LocalAddr().(*net.UDPAddr).Port, raw)
 
-				// Skip DTLS/STUN control packets (not data)
-				if isDTLSRange(raw[0]) || isSTUNPacket(raw) { continue }
+				if len(raw) == 0 { continue }
+				if isDTLSRange(raw[0]) || isSTUNPacket(raw) {
+					// WebRTC: respond to STUN Binding Requests only (not responses, to avoid ping-pong)
+					if rt.cfg.Wire == WireWebRTC && isSTUNRequest(raw) {
+						resp := buildSTUNBindingResponse(raw[8:20])
+						_, _ = uc.WriteToUDP(resp, from)
+						rt.pc.WriteUDP(dst, uc.LocalAddr().(*net.UDPAddr).Port, src, from.Port, resp)
+					}
+					continue
+				}
 
 				h, payload, e2 := decodeUDPFrame(rt.cfg, rt.ae, raw, sess)
 				if e2 != nil { continue }
@@ -1026,13 +1061,11 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 				continue
 			}
 
-			// 来自应用：加壳 -> 先发真实帧，再插播 shim 诱饵（RPS 优先）→ 插播额外伪报文
 			appPeerMu.Lock(); appPeer = from; appPeerMu.Unlock()
 			p := append([]byte(nil), buf[:n]...)
 
-			// a) 真实帧
-			var twccSeq uint32
-			frame := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, sess, p, false, &twccSeq)
+			// a) 真实帧（使用共享 twccSeq）
+			frame := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, sess, p, false, &rt.twccSeq)
 			rt.tb.wait(len(frame) + 28)
 			_, _ = uc.WriteToUDP(frame, saddr)
 			metricFramesUp.Add(1); metricBytesUp.Add(int64(n))
@@ -1040,24 +1073,29 @@ func runUDPClient(ctx context.Context, rt *runtimeCtx) error {
 			dstIP := ip4OrLoopback(saddr.IP)
 			rt.pc.WriteUDP(srcIP, uc.LocalAddr().(*net.UDPAddr).Port, dstIP, saddr.Port, frame)
 
-			// b) shim 诱饵
+			// b) shim 诱饵（延迟发送避免突发）
 			sendDecoy := false
 			if rt.shimUpRL != nil && rt.shimUpRL.takeMax(1) > 0 { sendDecoy = true
 			} else if rt.cfg.DecoyRps <= 0 && grnd.Intn(100) < rt.cfg.DecoyPct { sendDecoy = true }
 			if sendDecoy {
+				// 延迟 2-8ms 避免与真实帧突发
+				time.Sleep(time.Duration(2+grnd.Intn(6)) * time.Millisecond)
 				djunk := make([]byte, len(p))
 				_, _ = cryptoRand.Read(djunk)
-				df := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, sess, djunk, true, &twccSeq)
+				df := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, sess, djunk, true, &rt.twccSeq)
 				rt.tb.wait(len(df) + 28)
 				_, _ = uc.WriteToUDP(df, saddr)
 				metricFramesUp.Add(1); metricShimDecoySent.Add(1)
 				rt.pc.WriteUDP(srcIP, uc.LocalAddr().(*net.UDPAddr).Port, dstIP, saddr.Port, df)
 			}
 
-			// c) 额外伪报文（无 shim；RTCP / pure RTP / STUN）
-			sendExtraDecoysUDP(uc, uc.LocalAddr().(*net.UDPAddr), saddr, rt, rtp.ssrc, &rtp.seq, &rtpTs, step, true)
+			// c) 额外伪报文（WebRTC 用 compound RTCP）
+			if rt.cfg.Wire == WireWebRTC {
+				sendWebRTCExtraDecoys(uc, uc.LocalAddr().(*net.UDPAddr), saddr, rt, rtp.ssrc, &rtp.seq, &rtpTs, step, true)
+			} else {
+				sendExtraDecoysUDP(uc, uc.LocalAddr().(*net.UDPAddr), saddr, rt, rtp.ssrc, &rtp.seq, &rtpTs, step, true)
+			}
 
-			// 节奏（fps）
 			base := 1000 / max(1, rt.cfg.FPS)
 			jitterSleep(base, rt.cfg.JitterPct)
 		}
@@ -1120,8 +1158,17 @@ func runUDPServer(ctx context.Context, rt *runtimeCtx) error {
 		dst := ip4OrLoopback(ln.LocalAddr().(*net.UDPAddr).IP)
 		rt.pc.WriteUDP(src, caddr.Port, dst, ln.LocalAddr().(*net.UDPAddr).Port, raw)
 
-		// Skip DTLS/STUN control packets
-		if len(raw) > 0 && (isDTLSRange(raw[0]) || isSTUNPacket(raw)) { continue }
+		// Handle DTLS/STUN control packets
+		if len(raw) > 0 && isDTLSRange(raw[0]) { continue }
+		if len(raw) > 0 && isSTUNPacket(raw) {
+			// WebRTC: respond to STUN Binding Requests only (not responses)
+			if rt.cfg.Wire == WireWebRTC && isSTUNRequest(raw) {
+				resp := buildSTUNBindingResponse(raw[8:20])
+				_, _ = ln.WriteToUDP(resp, caddr)
+				rt.pc.WriteUDP(dst, ln.LocalAddr().(*net.UDPAddr).Port, src, caddr.Port, resp)
+			}
+			continue
+		}
 
 		h, p, e2 := decodeUDPFrame(rt.cfg, rt.ae, raw, 0)
 		if e2 != nil { continue }
@@ -1154,9 +1201,8 @@ func runUDPServer(ctx context.Context, rt *runtimeCtx) error {
 					if e2 != nil { return }
 					pp := append([]byte(nil), b[:n2]...)
 
-					// a) 真实帧
-					var twccSeq uint32
-					pkt := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, k.sess, pp, false, &twccSeq)
+					// a) 真实帧（使用共享 twccSeq）
+					pkt := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, k.sess, pp, false, &rt.twccSeq)
 					rt.tb.wait(len(pkt) + 28)
 					_, _ = ln.WriteToUDP(pkt, s.client)
 					metricFramesDown.Add(1); metricBytesDown.Add(int64(n2))
@@ -1164,22 +1210,27 @@ func runUDPServer(ctx context.Context, rt *runtimeCtx) error {
 					dst2 := ip4OrLoopback(s.client.IP)
 					rt.pc.WriteUDP(src2, ln.LocalAddr().(*net.UDPAddr).Port, dst2, s.client.Port, pkt)
 
-					// b) shim 诱饵
+					// b) shim 诱饵（延迟避免突发）
 					sendDecoy := false
 					if rt.shimDownRL != nil && rt.shimDownRL.takeMax(1) > 0 { sendDecoy = true
 					} else if rt.cfg.DecoyRps <= 0 && grnd.Intn(100) < rt.cfg.DecoyPct { sendDecoy = true }
 					if sendDecoy {
+						time.Sleep(time.Duration(2+grnd.Intn(6)) * time.Millisecond)
 						djunk := make([]byte, len(pp))
 						_, _ = cryptoRand.Read(djunk)
-						df := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, k.sess, djunk, true, &twccSeq)
+						df := encodeUDPFrame(rt.cfg, rt.ae, &rtp, &rtpTs, step, k.sess, djunk, true, &rt.twccSeq)
 						rt.tb.wait(len(df) + 28)
 						_, _ = ln.WriteToUDP(df, s.client)
 						metricFramesDown.Add(1); metricShimDecoySent.Add(1)
 						rt.pc.WriteUDP(src2, ln.LocalAddr().(*net.UDPAddr).Port, dst2, s.client.Port, df)
 					}
 
-					// c) 额外伪报文（无 shim；RTCP / pure RTP / STUN），发往 client
-					sendExtraDecoysUDP(ln, ln.LocalAddr().(*net.UDPAddr), s.client, rt, rtp.ssrc, &rtp.seq, &rtpTs, step, false)
+					// c) 额外伪报文（WebRTC 用 compound RTCP）
+					if rt.cfg.Wire == WireWebRTC {
+						sendWebRTCExtraDecoys(ln, ln.LocalAddr().(*net.UDPAddr), s.client, rt, rtp.ssrc, &rtp.seq, &rtpTs, step, false)
+					} else {
+						sendExtraDecoysUDP(ln, ln.LocalAddr().(*net.UDPAddr), s.client, rt, rtp.ssrc, &rtp.seq, &rtpTs, step, false)
+					}
 
 					// 节奏（fps）
 					base := 1000 / max(1, rt.cfg.FPS)

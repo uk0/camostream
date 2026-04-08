@@ -224,3 +224,45 @@ func runSTUNConsent(ctx context.Context, conn *net.UDPConn, peer *net.UDPAddr, p
 		}
 	}
 }
+
+// sendWebRTCExtraDecoys sends compound RTCP and STUN with proper WebRTC formatting.
+func sendWebRTCExtraDecoys(conn *net.UDPConn, src *net.UDPAddr, dst *net.UDPAddr, rt *runtimeCtx,
+	ssrc uint32, seq *uint16, ts *uint32, step int, upDirection bool) {
+
+	srcIP := ip4OrLoopback(src.IP)
+	dstIP := ip4OrLoopback(dst.IP)
+
+	var rl *decoyRL
+	if upDirection {
+		rl = rt.upRL
+	} else {
+		rl = rt.downRL
+	}
+	const maxBurst = 2
+
+	// Compound RTCP (SR+SDES) instead of bare SR
+	if rl != nil && rl.sr != nil {
+		n := rl.sr.takeMax(maxBurst)
+		for i := 0; i < n; i++ {
+			pktCount := uint32(metricFramesUp.Value())
+			octCount := uint32(metricBytesUp.Value())
+			compound := buildCompoundRTCP(ssrc, *ts, pktCount, octCount)
+			rt.tb.wait(len(compound) + 28)
+			_, _ = conn.WriteToUDP(compound, dst)
+			rt.pc.WriteUDP(srcIP, src.Port, dstIP, dst.Port, compound)
+			metricRTCPsrSent.Add(1)
+		}
+	}
+
+	// STUN with FINGERPRINT
+	if rl != nil && rl.stun != nil {
+		n := rl.stun.takeMax(1)
+		for i := 0; i < n; i++ {
+			req := buildSTUNBindingRequestFull()
+			rt.tb.wait(len(req) + 28)
+			_, _ = conn.WriteToUDP(req, dst)
+			rt.pc.WriteUDP(srcIP, src.Port, dstIP, dst.Port, req)
+			metricSTUNSent.Add(1)
+		}
+	}
+}
